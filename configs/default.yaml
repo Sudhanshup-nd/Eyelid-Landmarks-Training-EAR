@@ -1,0 +1,62 @@
+seed: 42
+
+data:
+  num_landmarks: 6          # used to declare output of heatmap model
+  image_size: 64
+  # mean: [0.485, 0.456, 0.406]     # taken from field-eye-crop-model/models/dms_eye_segmentor/dms_eye_segmentor_onnx.py
+  # std:  [0.229, 0.224, 0.225]
+  mean: [0.485]                      # for grayscale, just use 0.5
+  std:  [0.229]                      # for grayscale, just use 0.
+  augment:
+    random_horizontal_flip: 0.3
+    random_vertical_flip:   0.3
+    random_rotation_deg:    0 # rotate randomly between -15 and +15 degrees
+    occlusion_p:            0.1
+    blur_p:                 0.1
+
+
+paths:
+  train_csv: /inwdata2a/sudhanshu/Unet_training_script/data-and-labels/final_split/train.csv
+  val_csv: /inwdata2a/sudhanshu/Unet_training_script/data-and-labels/final_split/val.csv
+  test_csv: /inwdata2a/sudhanshu/Unet_training_script/data-and-labels/final_split/train.csv
+  output_dir: /inwdata2a/sudhanshu/Unet_training_script/outputs_landmarks_unet_op
+
+training:
+  batch_size: 32
+  epochs: 100
+  num_workers: 4
+  lr: 0.0005
+  weight_decay: 0.01
+  early_stop_patience: 50
+  landmark_loss_type: heatmap    # choices: l1, mse, smooth_l1, huber, wing, probabilistic
+  landmark_loss:
+    huber_delta: 1.0
+    wing_w: 10.0
+    wing_epsilon: 2.0
+    heatmap_lambda_coord: 100.0  # Make coordinate loss DOMINATE (heatmap loss ~600, coord ~1)
+    heatmap_landmark_weights: null
+
+    # Auxiliary coordinate loss type for heatmap training
+    #   - "l1": masked L1 on coords (default)
+    #   - "wing": WingLandmarkLoss on coords (similar to eyelid-training setup)
+    coord_loss_type: wing  # Use Wing loss for better gradient dynamics
+    coord_wing_w: 10.0
+    coord_wing_epsilon: 2.0
+
+
+model:
+  backbone: unet_segmentation_freezed  # choices: resnet18, unet_encoder_unfreezed, unet_encoder_freezed, unet_segmentation_freezed
+  pretrain_encoder_ckpt: /inwdata2a/sudhanshu/landmarks_only_training/outputs_landmarks_unet/dyotana-model.pt   # this is fixed and only used if backbone is unet_encoder_freezed or unet_segmentation_freezed
+
+
+inference:
+  backbone: unet_segmentation_freezed  # choices: resnet18, unet_encoder_unfreezed, unet_encoder_freezed, unet_encoder_unfreezed-heatmap, unet_encoder_freezed-heatmap
+  pck_thresholds: [0.05, 0.1]
+
+checkpoint:
+  save_best_metric: val_lmk_l1
+
+debug:
+  enabled: False
+  verbose_transforms: False
+

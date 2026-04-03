@@ -1,0 +1,15 @@
+
+
+# Data
+data-and-labels/
+
+
+# output folders
+outputs_landmarks_unet/
+outputs_landmarks_unet_op/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
