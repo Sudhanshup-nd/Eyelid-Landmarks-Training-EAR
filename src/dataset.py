@@ -179,6 +179,19 @@ class MouthDataset(Dataset):
         pts        = self._parse_landmarks(
                          row.landmarks_coordinates_inside_mouth_bbox
                      )
+        
+        # ── 2a. Clamp mouth bbox to face crop bounds ────────���────────────────
+        # face_bbox is (fx1, fy1, fx2, fy2): describes face crop region, so mouth_bbox is relative within that crop
+        fw = face_bbox[2] - face_bbox[0]
+        fh = face_bbox[3] - face_bbox[1]
+        mx1, my1, mx2, my2 = mouth_bbox
+        mx1 = max(0, min(mx1, fw-1))
+        mx2 = max(0, min(mx2, fw-1))
+        my1 = max(0, min(my1, fh-1))
+        my2 = max(0, min(my2, fh-1))
+        mx1, mx2 = sorted([mx1, mx2])
+        my1, my2 = sorted([my1, my2])
+        mouth_bbox = (mx1, my1, mx2, my2)
 
         # ── 3. Load DMS frame → face crop → mouth crop ────────────────────────
         if not os.path.exists(row.path_to_dataset):
