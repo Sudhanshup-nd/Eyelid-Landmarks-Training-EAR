@@ -17,8 +17,8 @@ import random
 import math
 
 # ------------------ PATHS ------------------
-INPUT_CSV   = Path("/inwdata2a/sudhanshu/Unet_training_script/data-and-labelles/annotation-phase-1-and-2-combined.csv")
-OUTPUT_DIR  = Path("/inwdata2a/sudhanshu/Unet_training_script/data-and-labelles/final_split")
+INPUT_CSV   = Path("/inwdata2a/sudhanshu/mouth_keypoints/mouth_labels_all.csv")
+OUTPUT_DIR  = Path("/inwdata2a/sudhanshu/mouth_keypoints/final_split")
 TRAIN_OUT   = OUTPUT_DIR / "train.csv"
 VAL_OUT     = OUTPUT_DIR / "val.csv"
 TEST_OUT    = OUTPUT_DIR / "test.csv"

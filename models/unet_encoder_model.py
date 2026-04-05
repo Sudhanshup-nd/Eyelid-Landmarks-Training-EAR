@@ -1,8 +1,9 @@
+import sys
 import torch
 import torch.nn as nn
 from typing import Dict
-
-from Unet_training_script.models.backbones.unet_wrapper import UnetEnc, UnetDec, UNetBackbone
+sys.path.insert(0, "/inwdata2a/sudhanshu/Unet_training_script")
+from models.backbones.unet_wrapper import UnetEnc, UnetDec, UNetBackbone
 
 
 
@@ -271,136 +272,78 @@ class LandmarkHeatmapHead(nn.Module):
         """
         return self.head(x)  # Return raw logits - softmax in soft-argmax handles normalization
 
+class MouthLandmarkModel(nn.Module):
+    """
+    End-to-end trainable mouth landmark detector.
 
-class EyeLandmarkWithFrozenSegmentationBackbone(nn.Module):
-    """
-    Multi-task model with frozen UnetUpSample_modified backbone.
-    
+    Unlike EyeLandmarkWithFrozenSegmentationBackbone, the backbone here
+    is fully trainable — gradients flow through the entire network.
+    This is necessary because the eye-pretrained backbone has never seen
+    mouth data and needs to adapt its features.
+
     Architecture:
-        1. Frozen UnetUpSample_modified (encoder + decoder + seg heads)
-        2. Trainable LandmarkHeatmapHead operating on decoder features
-    
-    Outputs during training:
-        - heatmaps: [B, num_landmarks, H, W]
-        - coords: [B, num_landmarks, 2] via soft-argmax
-    
-    Outputs during inference (optional):
-        - heatmaps: [B, num_landmarks, H, W]
-        - coords: [B, num_landmarks, 2]
-        - output1: segmentation mask (from frozen model)
-        - output2: blink suppression (from frozen model)
+        UnetUpSample_modified (backbone — fully trainable)
+            ↓ dec64 features [B, 16, H, W]
+        LandmarkHeatmapHead (heatmap prediction)
+            ↓
+        soft-argmax → coords [B, L, 2]
     """
-    def __init__(self, 
-                 segmentation_model: nn.Module,
-                 num_landmarks: int = 6,
-                 return_segmentation_outputs: bool = True):
+    def __init__(self, backbone: nn.Module, num_landmarks: int = 4):
         super().__init__()
         self.num_landmarks = num_landmarks
-        self.return_segmentation_outputs = return_segmentation_outputs
-        
-        # Frozen segmentation backbone
-        self.segmentation_model = segmentation_model
-        self._freeze_segmentation_model()
-        
-        # Trainable heatmap head
+        self.backbone      = backbone   # fully trainable — no freezing
+
         self.heatmap_head = LandmarkHeatmapHead(
-            in_channels=16,  # dec64 output channels
-            num_landmarks=num_landmarks
+            in_channels  = 16,           # dec64 output channels
+            num_landmarks = num_landmarks
         )
-        
-        print(f"[INFO] Created EyeLandmarkWithFrozenSegmentationBackbone:")
-        print(f"  - Frozen segmentation model params: {sum(p.numel() for p in self.segmentation_model.parameters())}")
-        print(f"  - Trainable heatmap head params: {sum(p.numel() for p in self.heatmap_head.parameters())}")
-        
-    def _freeze_segmentation_model(self):
-        """Freeze all parameters in the segmentation model."""
-        for param in self.segmentation_model.parameters():
-            param.requires_grad = False
-        self.segmentation_model.eval()
-        print("[INFO] Frozen segmentation model (all params set to requires_grad=False)")
-    
+
+        total    = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"[INFO] MouthLandmarkModel created")
+        print(f"[INFO] Total params: {total}  |  Trainable: {trainable}")
+
     def _extract_decoder_features(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Extract features from dec64 layer (before seg1/seg2 heads).
-        Returns: [B, 16, H, W]
+        Full forward pass through backbone up to dec64.
+        Gradients flow freely — backbone updates during training.
         """
-        # Forward through frozen segmentation encoder+decoder
-        # We need to replicate the forward pass up to dec64 output
-        with torch.no_grad():
-            # Encoder
-            x64, x = self.segmentation_model.enc64(x)
-            x32, x = self.segmentation_model.enc32(x)
-            x16, x = self.segmentation_model.enc16(x)
-            x8, x = self.segmentation_model.enc8(x)
-            x = self.segmentation_model.conv(x)
-            
-            # Decoder
-            x = self.segmentation_model.dec8(x, x8)
-            x = self.segmentation_model.dec16(x, x16)
-            x = self.segmentation_model.dec32(x, x32)
-            x = self.segmentation_model.dec64(x, x64)  # [B, 16, H, W]
-        
-        # CRITICAL: Detach to ensure no gradients flow to frozen model
-        # But this should still allow gradients to flow through heatmap_head
-        return x.detach()
-    
+        # Encoder
+        x64, x = self.backbone.enc64(x)
+        x32, x = self.backbone.enc32(x)
+        x16, x = self.backbone.enc16(x)
+        x8,  x = self.backbone.enc8(x)
+        x      = self.backbone.conv(x)
+
+        # Decoder
+        x = self.backbone.dec8(x,  x8)
+        x = self.backbone.dec16(x, x16)
+        x = self.backbone.dec32(x, x32)
+        x = self.backbone.dec64(x, x64)   # [B, 16, H, W]
+
+        return x   # no detach — gradients flow back through here
+
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
-        x: [B, 1, H, W] grayscale input
-        
-        Returns dict with:
-            - heatmaps: [B, num_landmarks, H, W]
-            - coords: [B, num_landmarks, 2] normalized to [0,1]
-            - output1: (optional) segmentation mask
-            - output2: (optional) blink suppression
+        x: [B, 1, H, W] grayscale mouth crop
+
+        Returns:
+            heatmaps: [B, L, H, W]
+            coords:   [B, L, 2] normalized [0,1]
         """
-        # Extract decoder features (frozen)
-        decoder_feats = self._extract_decoder_features(x)  # [B, 16, H, W]
-        
-        # Generate heatmaps (trainable)
-        heatmaps = self.heatmap_head(decoder_feats)  # [B, num_landmarks, H, W]
-        
-        # CRITICAL FIX: Scale heatmaps by 100x before soft-argmax to make softmax sharper
-        # This compensates for the low-magnitude outputs from the randomly initialized head
-        coords = self._soft_argmax_2d(heatmaps * 100.0, temperature=1.0)  # [B, num_landmarks, 2]
-        
-        output = {
-            "heatmaps": heatmaps,
-            "coords": coords,
-        }
-        
-        # Optionally include segmentation outputs
-        if self.return_segmentation_outputs:
-            with torch.no_grad():
-                output1, output2 = self.segmentation_model(x)
-                output["output1"] = output1
-                output["output2"] = output2
-        
-        return output
-    
-    def _soft_argmax_2d(self, heatmaps: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
-        """
-        Differentiable coordinates from heatmaps via soft-argmax.
-        Returns normalized coords in [0,1] relative to W,H.
-        heatmaps: [B,L,H,W] raw logits
-        temperature: softmax temperature (higher = softer distribution)
-        """
+        feats    = self._extract_decoder_features(x)          # [B, 16, H, W]
+        heatmaps = self.heatmap_head(feats)                    # [B, L, H, W]
+        coords   = self._soft_argmax_2d(heatmaps * 100.0)     # [B, L, 2]
+
+        return {"heatmaps": heatmaps, "coords": coords}
+
+    def _soft_argmax_2d(self, heatmaps: torch.Tensor) -> torch.Tensor:
         B, L, H, W = heatmaps.shape
-        hm_flat = heatmaps.view(B, L, -1)           # [B,L,H*W]
-        
-        # Apply temperature scaling before softmax
-        prob = torch.softmax(hm_flat / temperature, dim=-1)       # [B,L,H*W]
+        prob = torch.softmax(heatmaps.view(B, L, -1), dim=-1)
 
-        ys = torch.linspace(0, 1, steps=H, device=heatmaps.device)
-        xs = torch.linspace(0, 1, steps=W, device=heatmaps.device)
-        yy, xx = torch.meshgrid(ys, xs, indexing='ij')   # [H,W]
-        grid = torch.stack([xx, yy], dim=-1).view(-1, 2) # [H*W,2]
+        ys = torch.linspace(0, 1, H, device=heatmaps.device)
+        xs = torch.linspace(0, 1, W, device=heatmaps.device)
+        yy, xx = torch.meshgrid(ys, xs, indexing='ij')
+        grid   = torch.stack([xx, yy], dim=-1).view(-1, 2)   # [H*W, 2]
 
-        coords = torch.matmul(prob, grid)  # [B,L,2]
-        return coords
-    
-    def train(self, mode: bool = True):
-        """Override train() to keep segmentation model in eval mode."""
-        super().train(mode)
-        self.segmentation_model.eval()  # Always keep frozen model in eval
-        return self        
+        return torch.matmul(prob, grid)   # [B, L, 2]

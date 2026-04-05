@@ -1,0 +1,12 @@
+-------------Generation of mouth bbox csv-------------------
+
+1. We already have full dms frames and the face and mouth bboxes and the lips keypoints
+
+2. Now we used /inwdata2a/sudhanshu/Unet_training_script/script/get_mouth_crops.ipynb which gives the csv and then we splitted the csv into train, test and val using
+/inwdata2a/sudhanshu/Unet_training_script/dataset_generation/split_train_val_test.py
+
+--------------Model training----------------------------
+
+1. We updated the eyedataset to mouthdatset to take dms frames and process in the eyedataset pipeline
+
+2. We updated Eyelandmark model to mouthlandmark model (now taking the Unet+head architecture) but end to end trainable

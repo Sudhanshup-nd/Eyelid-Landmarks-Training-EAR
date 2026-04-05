@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Evaluation script with Frame Success Rate (FSR) and PCK.
+Evaluation script for mouth landmark detection with FSR and PCK metrics.
 
 Usage:
-  python -m Unet_training_script.src.evaluate_predictions_unet_fsr \
-    --checkpoint /inwdata2a/sudhanshu/Unet_training_script/outputs_landmarks_unet/best.pt \
+  python -m Unet_training_script.src.evaluate_predictions_unet_fsr   \
+    --checkpoint /inwdata2a/sudhanshu/mouth_keypoints/outputs_landmarks_unet_op/best.pt \
     --config     /inwdata2a/sudhanshu/Unet_training_script/configs/default.yaml \
-    --visualize  --show_gt  --limit 20
+    --visualize  --show_gt  --limit 200
 """
 
 import argparse
@@ -23,64 +23,81 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # Package path setup
-THIS_FILE   = Path(__file__).resolve()
+THIS_FILE    = Path(__file__).resolve()
 PROJECT_ROOT = THIS_FILE.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 if __package__ in (None, ""):
     __package__ = "Unet_training_script.src"
 
-from .dataset import EyeDataset
+from .dataset import MouthDataset
 from .transforms import build_val_transforms
 from .utils import (
     load_config, load_checkpoint, ensure_dir,
-    load_frozen_unet_segmentation_model, compute_fsr_torch
+    load_unet_segmentation_model, compute_fsr_torch
 )
-from ..models.unet_encoder_model import EyeLandmarkWithFrozenSegmentationBackbone
+from ..models.unet_encoder_model import MouthLandmarkModel, generate_gaussian_heatmaps
 
 
-# ── VISUALISATION ─────────────────────────────────────────────────────────────
+# ── COORDINATE HELPERS ────────────────────────────────────────────────────────
 
-def denormalize_landmarks(lm_norm: torch.Tensor, bbox: torch.Tensor):
+def denormalize_landmarks(lm_norm: torch.Tensor, mouth_bbox: torch.Tensor):
     """
-    Convert [0,1] normalized local landmarks back to face pixel space.
-    Inverse of training normalization: lx = (x - x1) / (x2 - x1 + 1)
-    Uses the same bbox as dataset.__getitem__ for consistency with training.
+    Convert [0,1] normalized mouth-crop-local landmarks back to face crop pixel space.
+    Inverse of training normalization: lx = (x - mx1) / (mx2 - mx1 + 1)
 
     Args:
-        lm_norm: [L, 2] tensor in [0,1]
-        bbox:    [4]    tensor (x1, y1, x2, y2) in face pixel space
+        lm_norm:    [L, 2] tensor in [0,1]
+        mouth_bbox: [4]    tensor (x1, y1, x2, y2) in face crop pixel space
 
     Returns:
-        list of (x, y) in face pixel space
+        list of (x, y) in face crop pixel space
     """
-    x1, y1, x2, y2 = bbox.tolist()
+    x1, y1, x2, y2 = mouth_bbox.tolist()
     bw = max(1.0, x2 - x1 + 1)
     bh = max(1.0, y2 - y1 + 1)
     return [(xn * bw + x1, yn * bh + y1)
             for xn, yn in lm_norm.tolist()]
 
 
-def visualize_sample(img_path: str, bbox: torch.Tensor,
-                     pred_abs, gt_abs, out_png: str, show_gt: bool = True):
+# ── VISUALISATION ─────────────────────────────────────────────────────────────
+
+def visualize_sample(img_path: str,
+                     face_bbox: torch.Tensor,
+                     mouth_bbox: torch.Tensor,
+                     pred_abs, gt_abs,
+                     out_png: str,
+                     show_gt: bool = True):
     """
     Save two-panel visualization:
-      Left:  full face image with eye bbox + landmarks overlaid
-      Right: zoomed eye crop at original resolution
+      Left:  face crop with mouth bbox + landmarks overlaid
+      Right: zoomed mouth crop at original resolution
 
-    All landmark coordinates are in face pixel space.
+    Coordinate spaces:
+      img_path   → full DMS frame
+      face_bbox  → face crop location in DMS frame space
+      mouth_bbox → mouth crop location in face crop space
+      pred_abs, gt_abs → landmarks in face crop space (after denormalize)
     """
-    face_img = Image.open(img_path)
-    x1, y1, x2, y2 = [int(v) for v in bbox.tolist()]
+    # ── Reconstruct face crop from DMS frame ──────────────────────────────────
+    dms_img      = Image.open(img_path)
+    fx1, fy1, fx2, fy2 = [int(v) for v in face_bbox.tolist()]
+    w_dms, h_dms = dms_img.size
+    fx1, fx2 = sorted([max(0, min(fx1, w_dms-1)), max(0, min(fx2, w_dms-1))])
+    fy1, fy2 = sorted([max(0, min(fy1, h_dms-1)), max(0, min(fy2, h_dms-1))])
+    face_crop = dms_img.crop((fx1, fy1, fx2+1, fy2+1))
+
+    # ── Mouth bbox in face crop space ─────────────────────────────────────────
+    mx1, my1, mx2, my2 = [int(v) for v in mouth_bbox.tolist()]
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
 
-    # ── Left panel: full face ─────────────────────────────────────────────────
-    axes[0].imshow(face_img, cmap='gray' if face_img.mode == 'L' else None)
+    # ── Left: face crop + mouth bbox + landmarks ───────────────────────────────
+    axes[0].imshow(face_crop, cmap='gray' if face_crop.mode == 'L' else None)
     axes[0].axis('off')
-    axes[0].set_title("Full face")
+    axes[0].set_title("Face crop")
     axes[0].add_patch(patches.Rectangle(
-        (x1, y1), x2 - x1, y2 - y1,
+        (mx1, my1), mx2 - mx1, my2 - my1,
         linewidth=1, edgecolor='yellow', facecolor='none'
     ))
     if pred_abs:
@@ -92,17 +109,17 @@ def visualize_sample(img_path: str, bbox: torch.Tensor,
                         c='red', s=20, marker='x', label='gt', zorder=5)
     axes[0].legend(loc='lower right', fontsize=7)
 
-    # ── Right panel: zoomed eye at original resolution ────────────────────────
-    pad     = 10
-    zx1     = max(0, x1 - pad)
-    zy1     = max(0, y1 - pad)
-    zx2     = min(face_img.size[0], x2 + pad)
-    zy2     = min(face_img.size[1], y2 + pad)
-    zoom    = face_img.crop((zx1, zy1, zx2, zy2))
+    # ── Right: zoomed mouth crop at original resolution ────────────────────────
+    pad  = 10
+    zx1  = max(0, mx1 - pad)
+    zy1  = max(0, my1 - pad)
+    zx2  = min(face_crop.size[0], mx2 + pad)
+    zy2  = min(face_crop.size[1], my2 + pad)
+    zoom = face_crop.crop((zx1, zy1, zx2, zy2))
 
-    axes[1].imshow(zoom, cmap='gray' if face_img.mode == 'L' else None)
+    axes[1].imshow(zoom, cmap='gray' if zoom.mode == 'L' else None)
     axes[1].axis('off')
-    axes[1].set_title("Eye region (original resolution)")
+    axes[1].set_title("Mouth crop (original resolution)")
     if pred_abs:
         axes[1].scatter([x - zx1 for x, y in pred_abs],
                         [y - zy1 for x, y in pred_abs],
@@ -123,19 +140,19 @@ def visualize_sample(img_path: str, bbox: torch.Tensor,
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint",   required=True)
-    ap.add_argument("--config",       required=True)
-    ap.add_argument("--limit",        type=int,  default=None,
+    ap.add_argument("--checkpoint",     required=True)
+    ap.add_argument("--config",         required=True)
+    ap.add_argument("--limit",          type=int, default=None,
                     help="Evaluate only first N samples")
-    ap.add_argument("--visible_only", action="store_true",
-                    help="Skip frames where eye_visibility=0")
-    ap.add_argument("--visualize",    action="store_true",
+    ap.add_argument("--visible_only",   action="store_true",
+                    help="Skip frames where mouth_visibility=0")
+    ap.add_argument("--visualize",      action="store_true",
                     help="Save overlay images")
-    ap.add_argument("--show_gt",      action="store_true",
+    ap.add_argument("--show_gt",        action="store_true",
                     help="Show GT landmarks in overlay")
     ap.add_argument("--save_per_point", action="store_true",
-                    help="Include per-point errors in CSV")
-    ap.add_argument("--percentiles",  type=str, default="90,95,99")
+                    help="Include per-point errors in output CSV")
+    ap.add_argument("--percentiles",    type=str, default="90,95,99")
     return ap.parse_args()
 
 
@@ -155,14 +172,13 @@ def main():
     if args.visualize:
         ensure_dir(overlay_dir)
 
-    # ── Model ─────────────────────────────────────────────────────────────────
+    # ── Model — identical to training script ──────────────────────────────────
     pretrain_path    = cfg['model']['pretrain_encoder_ckpt']
-    frozen_seg_model = load_frozen_unet_segmentation_model(pretrain_path, device=device)
+    backbone = load_unet_segmentation_model(pretrain_path, device=device)
 
-    model = EyeLandmarkWithFrozenSegmentationBackbone(
-        segmentation_model=frozen_seg_model,
+    model = MouthLandmarkModel(
+        backbone=backbone,
         num_landmarks=int(cfg['data']['num_landmarks']),
-        return_segmentation_outputs=True
     ).to(device)
 
     ckpt = load_checkpoint(args.checkpoint, map_location=device)
@@ -170,18 +186,14 @@ def main():
     model.eval()
     print(f"[INFO] Loaded checkpoint: {args.checkpoint}")
 
-    # ── Data — same pipeline as training ─────────────────────────────────────
-    # EyeDataset handles all parsing, cropping, normalization identically to
-    # training. No reimplementation needed here.
-    dataset = EyeDataset(
+    # ── Data — identical pipeline to training ─────────────────────────────────
+    dataset = MouthDataset(
         csv_path  = cfg['paths']['test_csv'],
         cfg       = cfg,
         transform = build_val_transforms(cfg),
-        is_train  = False    # no augmentation
+        is_train  = False
     )
-
     if args.limit is not None:
-        # Subset by slicing valid_indices
         dataset.valid_indices = dataset.valid_indices[:args.limit]
 
     loader = DataLoader(
@@ -196,27 +208,29 @@ def main():
     # ── Evaluation loop ───────────────────────────────────────────────────────
     num_landmarks  = int(cfg['data']['num_landmarks'])
     pck_thresholds = cfg['inference']['pck_thresholds']
-    pct_list       = [int(p.strip()) for p in args.percentiles.split(",") if p.strip().isdigit()]
+    pct_list       = [int(p.strip()) for p in args.percentiles.split(",")
+                      if p.strip().isdigit()]
 
-    per_sample_rows  = []
-    all_point_l2     = []
-    all_point_norm   = []
-    per_image_nme    = []
+    per_sample_rows    = []
+    all_point_l2       = []
+    all_point_norm     = []
+    per_image_nme      = []
     all_frame_max_norm = []
-    samples_used     = 0
-    skipped          = 0
+    samples_used       = 0
+    skipped            = 0
 
     for batch_idx, batch in enumerate(tqdm(loader, desc="Evaluating")):
-        img      = batch['image'].to(device)       # [B, 1, H, W]
-        lmk_gt   = batch['landmarks']              # [B, L, 2] normalized [0,1]
-        mask     = batch['mask']                   # [B, L]
-        vis      = batch['visibility'].view(-1)    # [B]
-        bboxes   = batch['bbox']                   # [B, 4] face pixel space
-        img_paths = batch['img_path']              # list of B paths
+        img         = batch['image'].to(device)      # [B, 1, H, W]
+        lmk_gt      = batch['landmarks']             # [B, L, 2] normalized [0,1]
+        mask        = batch['mask']                  # [B, L]
+        vis         = batch['visibility'].view(-1)   # [B]
+        mouth_bboxes = batch['bbox']                 # [B, 4] mouth bbox in face crop space
+        face_bboxes  = batch['face_bbox']            # [B, 4] face bbox in DMS frame space
+        img_paths    = batch['img_path']             # list of B paths
 
         with torch.no_grad():
-            out        = model(img)
-            pred_norm  = out['coords'].cpu()       # [B, L, 2] normalized [0,1]
+            out       = model(img)
+            pred_norm = out['coords'].cpu()          # [B, L, 2] normalized [0,1]
 
         for i in range(img.shape[0]):
             gt_vis = int(vis[i].item())
@@ -224,27 +238,27 @@ def main():
                 skipped += 1
                 continue
 
-            # Skip if no valid landmarks in this sample
             if mask[i].sum() == 0:
                 skipped += 1
                 continue
 
-            bbox       = bboxes[i]                  # [4] original face bbox
-            pred_lm    = pred_norm[i]               # [L, 2] normalized
-            gt_lm      = lmk_gt[i]                  # [L, 2] normalized
+            mouth_bbox = mouth_bboxes[i]   # [4] mouth bbox in face crop space
+            face_bbox  = face_bboxes[i]    # [4] face bbox in DMS frame space
+            pred_lm    = pred_norm[i]      # [L, 2] normalized
+            gt_lm      = lmk_gt[i]        # [L, 2] normalized
 
-            # Denormalize both to face pixel space for L2 metric
-            pred_abs   = denormalize_landmarks(pred_lm, bbox)
-            gt_abs     = denormalize_landmarks(gt_lm,   bbox)
+            # Denormalize both to face crop pixel space for L2 metric
+            # mouth_bbox is used — same bbox dataset used for normalization
+            pred_abs = denormalize_landmarks(pred_lm, mouth_bbox)
+            gt_abs   = denormalize_landmarks(gt_lm,   mouth_bbox)
 
-            pred_arr   = np.array(pred_abs)         # [L, 2]
-            gt_arr     = np.array(gt_abs)           # [L, 2]
+            pred_arr = np.array(pred_abs)   # [L, 2]
+            gt_arr   = np.array(gt_abs)     # [L, 2]
 
-            # Eye width from GT x-coords — used as normalization reference
-            eye_width  = max(1.0, gt_arr[:, 0].max() - gt_arr[:, 0].min())
-
-            point_l2   = np.sqrt(((pred_arr - gt_arr) ** 2).sum(axis=1))  # [L]
-            point_norm = point_l2 / eye_width                              # [L]
+            # Normalize errors by mouth width (x-span of GT landmarks)
+            mouth_width = max(1.0, gt_arr[:, 0].max() - gt_arr[:, 0].min())
+            point_l2    = np.sqrt(((pred_arr - gt_arr) ** 2).sum(axis=1))  # [L]
+            point_norm  = point_l2 / mouth_width                            # [L]
 
             all_point_l2.extend(point_l2.tolist())
             all_point_norm.extend(point_norm.tolist())
@@ -258,7 +272,7 @@ def main():
                 "mean_l2":       float(point_l2.mean()),
                 "mean_norm":     float(point_norm.mean()),
                 "max_norm":      float(point_norm.max()),
-                "eye_width":     eye_width,
+                "mouth_width":   mouth_width,
             }
             if args.save_per_point:
                 for j in range(num_landmarks):
@@ -267,9 +281,12 @@ def main():
             per_sample_rows.append(row_dict)
 
             if args.visualize:
-                out_png = os.path.join(overlay_dir, f"sample_{batch_idx * loader.batch_size + i}.png")
+                out_png = os.path.join(
+                    overlay_dir,
+                    f"sample_{batch_idx * loader.batch_size + i}.png"
+                )
                 visualize_sample(
-                    img_paths[i], bbox,
+                    img_paths[i], face_bbox, mouth_bbox,
                     pred_abs, gt_abs if args.show_gt else None,
                     out_png, show_gt=args.show_gt
                 )
@@ -287,7 +304,7 @@ def main():
             f"Samples evaluated : {samples_used}  (skipped: {skipped})",
             f"Points evaluated  : {all_l2_arr.size}",
             f"",
-            f"── Pixel L2 ───────────────────────────────",
+            f"── Pixel L2 ───────────────────────────────────────",
             f"Mean   : {all_l2_arr.mean():.4f} px",
             f"Median : {np.median(all_l2_arr):.4f} px",
             f"Std    : {all_l2_arr.std():.4f} px",
@@ -297,13 +314,13 @@ def main():
 
         lines += [
             f"",
-            f"── NME (normalized by eye width) ──────────",
+            f"── NME (normalized by mouth width) ────────────────",
             f"Mean per-image NME : {image_nme_arr.mean():.6f}",
             f"Global NME         : {all_norm_arr.mean():.6f}",
             f"",
-            f"── PCK / FSR ──────────────────────────────",
+            f"── PCK / FSR ──────────────────────────────────────",
             f"{'Threshold':<10} | {'PCK (point-wise)':<18} | {'FSR (frame-wise)':<18}",
-            "-" * 52,
+            "-" * 54,
         ]
         for thr in pck_thresholds:
             pck = (all_norm_arr       <= thr).sum() / max(1, all_norm_arr.size)

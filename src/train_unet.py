@@ -8,21 +8,21 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from .dataset import EyeDataset
+from .dataset import MouthDataset
 from .transforms import build_train_transforms, build_val_transforms
 from .losses import build_landmark_loss, HeatmapLossWrapper
 from .utils import (
     load_config, seed_everything, ensure_dir, save_checkpoint,
-    load_frozen_unet_segmentation_model, compute_fsr_torch, save_val_heatmaps
+    load_unet_segmentation_model, compute_fsr_torch, save_val_heatmaps
 )
-from ..models.unet_encoder_model import EyeLandmarkWithFrozenSegmentationBackbone, generate_gaussian_heatmaps
+from ..models.unet_encoder_model import MouthLandmarkModel, generate_gaussian_heatmaps
 
 
 # ── DATA ──────────────────────────────────────────────────────────────────────
 
 def build_dataloaders(cfg):
-    train_ds = EyeDataset(cfg['paths']['train_csv'], cfg, transform=build_train_transforms(cfg), is_train=True)
-    val_ds   = EyeDataset(cfg['paths']['val_csv'],   cfg, transform=build_val_transforms(cfg),   is_train=False)
+    train_ds = MouthDataset(cfg['paths']['train_csv'], cfg, transform=build_train_transforms(cfg), is_train=True)
+    val_ds   = MouthDataset(cfg['paths']['val_csv'],   cfg, transform=build_val_transforms(cfg),   is_train=False)
 
     bs = int(cfg['training']['batch_size'])
     nw = int(cfg['training']['num_workers'])
@@ -143,18 +143,19 @@ def main():
 
     # ── Model ─────────────────────────────────────────────────────────────────
     pretrain_path = cfg['model']['pretrain_encoder_ckpt']
-    print(f"[INFO] Loading frozen segmentation backbone from: {pretrain_path}")
-    frozen_seg_model = load_frozen_unet_segmentation_model(pretrain_path, device=device)
+    print(f"[INFO] Loading backbone (end-to-end trainable) from: {pretrain_path}")
 
-    model = EyeLandmarkWithFrozenSegmentationBackbone(
-        segmentation_model=frozen_seg_model,
-        num_landmarks=int(cfg['data']['num_landmarks']),
-        return_segmentation_outputs=True
+    # Load backbone weights — train mode, gradients enabled
+    backbone = load_unet_segmentation_model(pretrain_path, device=device)
+
+    # Wrap in fully trainable mouth model
+    model = MouthLandmarkModel(
+        backbone      = backbone,
+        num_landmarks = int(cfg['data']['num_landmarks'])
     ).to(device)
 
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    frozen_params    = sum(p.numel() for p in model.parameters() if not p.requires_grad)
-    print(f"[INFO] Trainable params: {trainable_params}  |  Frozen params: {frozen_params}")
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[INFO] Trainable params: {trainable}")   # should be ~51k+ now, not 14k
 
     # ── Optimizer and loss ────────────────────────────────────────────────────
     optimizer = optim.AdamW(

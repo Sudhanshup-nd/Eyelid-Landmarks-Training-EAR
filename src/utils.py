@@ -282,7 +282,7 @@ def load_unet_encoder_backbone_from_ckpt(ckpt_path, cfg=None, device="cpu"):
 
 
 
-def load_frozen_unet_segmentation_model(ckpt_path, cfg=None, device="cpu"):
+def load_unet_segmentation_model(ckpt_path, cfg=None, device="cpu"):
     """
     Load a complete UnetUpSample_modified model from checkpoint and freeze it.
 
@@ -303,7 +303,9 @@ def load_frozen_unet_segmentation_model(ckpt_path, cfg=None, device="cpu"):
     # "eye_internal_segmentor.model.unet_wrapper" — which no longer exists.
     # Fix: inject fake modules at those exact paths into sys.modules so pickle
     # finds them and redirects to our real local classes without touching disk.
-    from Unet_training_script.models.backbones.unet_wrapper import (
+ 
+    sys.path.insert(0, "/inwdata2a/sudhanshu/Unet_training_script")
+    from models.backbones.unet_wrapper import (
         UnetDec,
         UnetEnc,
         Unet,
@@ -347,15 +349,12 @@ def load_frozen_unet_segmentation_model(ckpt_path, cfg=None, device="cpu"):
     model = UnetUpSample_modified().to(device)
     model.load_state_dict(model_state, strict=True)
 
-    # ── 5. FREEZE ────────────────────────────────────────────────────────────
-    # requires_grad=False → excludes all params from gradient computation
-    # model.eval()        → disables Dropout + fixes BatchNorm running stats
-    for param in model.parameters():
-        param.requires_grad = False
-    model.eval()
+    # ── 5. SET TO TRAIN MODE ─────────────────────────────────────────────────
+    # requires_grad=True by default → all params participate in backprop
+    model.train()
 
-    print(f"[INFO] Loaded and froze UnetUpSample_modified from: {ckpt_path}")
-    print(f"[INFO] Total frozen params: {sum(p.numel() for p in model.parameters())}")
+    print(f"[INFO] Loaded and set UnetUpSample_modified to train mode from: {ckpt_path}")
+    print(f"[INFO] Total trainable params: {sum(p.numel() for p in model.parameters())}")
 
     return model
 
