@@ -6,7 +6,7 @@ Usage:
   python -m Unet_training_script.src.evaluate_predictions_unet_fsr   \
     --checkpoint /inwdata2a/sudhanshu/mouth_keypoints/outputs_landmarks_unet_op/best.pt \
     --config     /inwdata2a/sudhanshu/Unet_training_script/configs/default.yaml \
-    --visualize  --show_gt 
+    --visualize  --show_gt  --limit 200
 """
 
 import argparse
