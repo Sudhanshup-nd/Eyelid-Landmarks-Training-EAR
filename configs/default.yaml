@@ -2,7 +2,7 @@ seed: 42
 
 data:
   num_landmarks: 4          # used to declare output of heatmap model
-  image_size: 64
+  image_size: 128
   # mean: [0.485, 0.456, 0.406]     # taken from field-eye-crop-model/models/dms_eye_segmentor/dms_eye_segmentor_onnx.py
   # std:  [0.229, 0.224, 0.225]
   mean: [0.485]                      # for grayscale, just use 0.5
@@ -19,7 +19,7 @@ paths:
   train_csv: /inwdata2a/sudhanshu/mouth_keypoints/final_split/train.csv
   val_csv: /inwdata2a/sudhanshu/mouth_keypoints/final_split/val.csv
   test_csv: /inwdata2a/sudhanshu/mouth_keypoints/final_split/test.csv
-  output_dir: /inwdata2a/sudhanshu/mouth_keypoints/outputs_landmarks_unet_op_v2
+  output_dir: /inwdata2a/sudhanshu/mouth_keypoints/outputs_landmarks_unet_op
 
 training:
   batch_size: 32
