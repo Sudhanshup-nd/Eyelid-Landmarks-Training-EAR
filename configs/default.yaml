@@ -19,7 +19,7 @@ paths:
   train_csv: /inwdata2a/sudhanshu/mouth_keypoints/final_split/train.csv
   val_csv: /inwdata2a/sudhanshu/mouth_keypoints/final_split/val.csv
   test_csv: /inwdata2a/sudhanshu/mouth_keypoints/mouth_labels_all.csv
-  output_dir: /inwdata2a/sudhanshu/mouth_keypoints/outputs_landmarks_unet_op_temp
+  output_dir: /inwdata2a/sudhanshu/mouth_keypoints/outputs_landmarks_unet_op_temp_2
 
 training:
   batch_size: 32

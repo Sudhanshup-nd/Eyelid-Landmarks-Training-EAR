@@ -7,7 +7,7 @@ Usage:
   python -m Unet_training_script.src.labeles_for_bheshaj   \
     --checkpoint /inwdata2a/sudhanshu/mouth_keypoints/outputs_landmarks_unet_op/best.pt \
     --config     /inwdata2a/sudhanshu/Unet_training_script/configs/default.yaml \
-    --visualize  --show_gt  --limit 200
+    --visualize  --show_gt  --limit 20
 """
 
 import argparse
@@ -88,12 +88,6 @@ def visualize_on_dms_frame(img_path: str,
     Save two-panel visualization overlaid on the original full DMS frame.
       Left:  full DMS frame with face bbox, mouth bbox, and landmarks
       Right: zoomed DMS frame around the mouth region at original resolution
-
-    Coordinate spaces:
-      img_path    → full DMS frame
-      face_bbox   → face crop location in DMS frame space  (fx1, fy1, fx2, fy2)
-      mouth_bbox  → mouth crop location in face crop space (mx1, my1, mx2, my2)
-      pred_abs, gt_abs → landmarks in face crop space → converted to DMS frame space here
     """
     dms_img      = Image.open(img_path)
     w_dms, h_dms = dms_img.size
@@ -106,7 +100,6 @@ def visualize_on_dms_frame(img_path: str,
     fy2 = max(0, min(fy2, h_dms - 1))
 
     # ── Mouth bbox → DMS frame space ──────────────────────────────────────────
-    # mouth_bbox is relative to face crop → shift by (fx1, fy1)
     mx1, my1, mx2, my2 = [int(v) for v in mouth_bbox.tolist()]
     dmx1, dmy1 = mx1 + fx1, my1 + fy1
     dmx2, dmy2 = mx2 + fx1, my2 + fy1
@@ -122,12 +115,10 @@ def visualize_on_dms_frame(img_path: str,
     axes[0].axis('off')
     axes[0].set_title("Full DMS frame")
 
-    # Face bbox (cyan)
     axes[0].add_patch(patches.Rectangle(
         (fx1, fy1), fx2 - fx1, fy2 - fy1,
         linewidth=1.5, edgecolor='cyan', facecolor='none', label='face'
     ))
-    # Mouth bbox (yellow)
     axes[0].add_patch(patches.Rectangle(
         (dmx1, dmy1), dmx2 - dmx1, dmy2 - dmy1,
         linewidth=1, edgecolor='yellow', facecolor='none', label='mouth'
@@ -182,15 +173,13 @@ def parse_args():
                     help="Save overlay images on DMS frame")
     ap.add_argument("--show_gt",        action="store_true",
                     help="Show GT landmarks in overlay")
-    ap.add_argument("--save_per_point", action="store_true",
-                    help="Include per-point errors in output CSV")
     ap.add_argument("--percentiles",    type=str, default="90,95,99")
     ap.add_argument("--overlay_dir",    type=str, default=None,
                     help="Override output directory for overlay images")
     return ap.parse_args()
 
 
-# ── MAIN ───────────────────────────────────���──────────────────────────────────
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 
 def main():
     args   = parse_args()
@@ -268,6 +257,13 @@ def main():
             out       = model(img)
             pred_norm = out['coords'].cpu()            # [B, L, 2] normalized [0,1]
 
+            heatmaps  = out['heatmaps']                # [B, L, H, W] raw logits
+            B, L, H, W = heatmaps.shape
+            prob      = torch.softmax(
+                            heatmaps.view(B, L, -1) * 100.0, dim=-1
+                        )                              # [B, L, H*W]
+            conf      = prob.max(dim=-1)[0].cpu()     # [B, L]
+
         for i in range(img.shape[0]):
             gt_vis = int(vis[i].item())
             if args.visible_only and gt_vis == 0:
@@ -282,6 +278,7 @@ def main():
             face_bbox  = face_bboxes[i]    # [4] face bbox in DMS frame space
             pred_lm    = pred_norm[i]      # [L, 2] normalized
             gt_lm      = lmk_gt[i]        # [L, 2] normalized
+            conf_np    = conf[i].numpy()   # [L] confidence per landmark
 
             # Denormalize to face crop pixel space
             pred_abs = denormalize_landmarks(pred_lm, mouth_bbox)
@@ -301,18 +298,15 @@ def main():
             all_frame_max_norm.append(float(point_norm.max()))
             samples_used += 1
 
+            # ── Landmarks → DMS frame space for CSV ───────────────────────────
+            pred_dms = landmarks_to_dms_frame(pred_abs, face_bbox)
+            lm_str   = ",".join(f"{x:.4f},{y:.4f}" for x, y in pred_dms)
+
             row_dict = {
-                "img_path":      img_paths[i],
-                "gt_visibility": gt_vis,
-                "mean_l2":       float(point_l2.mean()),
-                "mean_norm":     float(point_norm.mean()),
-                "max_norm":      float(point_norm.max()),
-                "mouth_width":   mouth_width,
+                "path_to_dms_frame": img_paths[i],
+                "mouth_landmarks": lm_str,
+                **{f"conf_pt{j}": float(conf_np[j]) for j in range(num_landmarks)},
             }
-            if args.save_per_point:
-                for j in range(num_landmarks):
-                    row_dict[f"l2_pt{j}"]   = float(point_l2[j])
-                    row_dict[f"norm_pt{j}"] = float(point_norm[j])
             per_sample_rows.append(row_dict)
 
             # ── DMS frame overlay ─────────────────────────────────────────────
