@@ -226,16 +226,16 @@ class EyeLandmarkUNetHeatmapModelWrapper(nn.Module):
 
 class LandmarkHeatmapHead(nn.Module):
     """
-    Lightweight heatmap regression head (Option 1).
+    Lightweight heatmap regression head.
     Takes decoder features [B, 16, H, W] → produces heatmaps [B, num_landmarks, H, W]
-    
+
     Architecture:
-        Conv2d(16→32) + BN + ReLU
-        Conv2d(32→16) + BN + ReLU
-        Conv2d(16→num_landmarks)
-        Soft-argmax → coords
-    
-    Trainable params: ~5K
+        Conv2d(16→32, 3×3) + ReLU
+        Conv2d(32→32, 3×3) + ReLU
+        Conv2d(32→num_landmarks, 1×1)
+        [soft-argmax applied externally in MouthLandmarkModel]
+
+    Trainable params: ~14K
     """
     def __init__(self, in_channels=16, num_landmarks=6):
         super().__init__()

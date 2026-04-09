@@ -3,7 +3,7 @@
 Evaluation script for mouth landmark detection with FSR and PCK metrics.
 
 Usage:
-  python -m Unet_training_script.src.evaluate_predictions_unet_fsr \
+  python -m Unet_training_script.src.evaluate_predictions_with_conf \
     --checkpoint /inwdata2a/sudhanshu/mouth_keypoints/outputs_landmarks_unet_op/best.pt \
     --config     /inwdata2a/sudhanshu/Unet_training_script/configs/default.yaml \
     --visualize  --show_gt  --limit 200
@@ -67,7 +67,8 @@ def visualize_sample(img_path: str,
                      mouth_bbox: torch.Tensor,
                      pred_abs, gt_abs,
                      out_png: str,
-                     show_gt: bool = True):
+                     show_gt: bool = True,
+                     conf_np: np.ndarray = None):
     """
     Save two-panel visualization:
       Left:  face crop with mouth bbox + landmarks overlaid
@@ -78,6 +79,7 @@ def visualize_sample(img_path: str,
       face_bbox  → face crop location in DMS frame space
       mouth_bbox → mouth crop location in face crop space
       pred_abs, gt_abs → landmarks in face crop space (after denormalize)
+      conf_np    → [L] confidence per landmark (softmax peak value)
     """
     # ── Reconstruct face crop from DMS frame ──────────────────────────────────
     dms_img      = Image.open(img_path)
@@ -100,10 +102,20 @@ def visualize_sample(img_path: str,
         (mx1, my1), mx2 - mx1, my2 - my1,
         linewidth=1, edgecolor='yellow', facecolor='none'
     ))
+
     if pred_abs:
-        axes[0].scatter([x for x, y in pred_abs], [y for x, y in pred_abs],
-                        c='lime', s=20, marker='o', edgecolors='black',
-                        linewidths=0.5, label='pred', zorder=5)
+        for j, (x, y) in enumerate(pred_abs):
+            axes[0].scatter(x, y, c='lime', s=20, marker='o',
+                            edgecolors='black', linewidths=0.5,
+                            label='pred' if j == 0 else None, zorder=5)
+            if conf_np is not None:
+                axes[0].annotate(
+                    f"{conf_np[j]:.3f}",
+                    (x, y),
+                    textcoords="offset points", xytext=(4, 4),
+                    fontsize=6, color='lime', zorder=6
+                )
+
     if show_gt and gt_abs:
         axes[0].scatter([x for x, y in gt_abs], [y for x, y in gt_abs],
                         c='red', s=20, marker='x', label='gt', zorder=5)
@@ -120,11 +132,20 @@ def visualize_sample(img_path: str,
     axes[1].imshow(zoom, cmap='gray' if zoom.mode == 'L' else None)
     axes[1].axis('off')
     axes[1].set_title("Mouth crop (original resolution)")
+
     if pred_abs:
-        axes[1].scatter([x - zx1 for x, y in pred_abs],
-                        [y - zy1 for x, y in pred_abs],
-                        c='lime', s=30, marker='o', edgecolors='black',
-                        linewidths=0.5, label='pred', zorder=5)
+        for j, (x, y) in enumerate(pred_abs):
+            axes[1].scatter(x - zx1, y - zy1, c='lime', s=30, marker='o',
+                            edgecolors='black', linewidths=0.5,
+                            label='pred' if j == 0 else None, zorder=5)
+            if conf_np is not None:
+                axes[1].annotate(
+                    f"{conf_np[j]:.3f}",
+                    (x - zx1, y - zy1),
+                    textcoords="offset points", xytext=(4, 4),
+                    fontsize=6, color='lime', zorder=6
+                )
+
     if show_gt and gt_abs:
         axes[1].scatter([x - zx1 for x, y in gt_abs],
                         [y - zy1 for x, y in gt_abs],
@@ -173,8 +194,8 @@ def main():
         ensure_dir(overlay_dir)
 
     # ── Model — identical to training script ──────────────────────────────────
-    pretrain_path    = cfg['model']['pretrain_encoder_ckpt']
-    backbone = load_unet_segmentation_model(pretrain_path, device=device)
+    pretrain_path = cfg['model']['pretrain_encoder_ckpt']
+    backbone      = load_unet_segmentation_model(pretrain_path, device=device)
 
     model = MouthLandmarkModel(
         backbone=backbone,
@@ -220,17 +241,28 @@ def main():
     skipped            = 0
 
     for batch_idx, batch in enumerate(tqdm(loader, desc="Evaluating")):
-        img         = batch['image'].to(device)      # [B, 1, H, W]
-        lmk_gt      = batch['landmarks']             # [B, L, 2] normalized [0,1]
-        mask        = batch['mask']                  # [B, L]
-        vis         = batch['visibility'].view(-1)   # [B]
-        mouth_bboxes = batch['bbox']                 # [B, 4] mouth bbox in face crop space
-        face_bboxes  = batch['face_bbox']            # [B, 4] face bbox in DMS frame space
-        img_paths    = batch['img_path']             # list of B paths
+        img          = batch['image'].to(device)      # [B, 1, H, W]
+        lmk_gt       = batch['landmarks']             # [B, L, 2] normalized [0,1]
+        mask         = batch['mask']                  # [B, L]
+        vis          = batch['visibility'].view(-1)   # [B]
+        mouth_bboxes = batch['bbox']                  # [B, 4] mouth bbox in face crop space
+        face_bboxes  = batch['face_bbox']             # [B, 4] face bbox in DMS frame space
+        img_paths    = batch['img_path']              # list of B paths
 
         with torch.no_grad():
             out       = model(img)
-            pred_norm = out['coords'].cpu()          # [B, L, 2] normalized [0,1]
+            pred_norm = out['coords'].cpu()           # [B, L, 2] normalized [0,1]
+
+            # ── Confidence: softmax peak over heatmap spatial dims ────────────
+            # Mirrors exactly what soft-argmax does: multiply by 100, softmax,
+            # then take peak probability as confidence score per landmark.
+            # Shape: raw logits [B, L, H, W] → prob [B, L, H*W] → conf [B, L]
+            heatmaps  = out['heatmaps']               # [B, L, H, W] raw logits
+            B, L, H, W = heatmaps.shape
+            prob      = torch.softmax(
+                            heatmaps.view(B, L, -1) * 100.0, dim=-1
+                        )                             # [B, L, H*W]
+            conf      = prob.max(dim=-1)[0].cpu()    # [B, L]
 
         for i in range(img.shape[0]):
             gt_vis = int(vis[i].item())
@@ -246,9 +278,9 @@ def main():
             face_bbox  = face_bboxes[i]    # [4] face bbox in DMS frame space
             pred_lm    = pred_norm[i]      # [L, 2] normalized
             gt_lm      = lmk_gt[i]        # [L, 2] normalized
+            conf_np    = conf[i].numpy()   # [L]   confidence per landmark
 
             # Denormalize both to face crop pixel space for L2 metric
-            # mouth_bbox is used — same bbox dataset used for normalization
             pred_abs = denormalize_landmarks(pred_lm, mouth_bbox)
             gt_abs   = denormalize_landmarks(gt_lm,   mouth_bbox)
 
@@ -266,6 +298,7 @@ def main():
             all_frame_max_norm.append(float(point_norm.max()))
             samples_used += 1
 
+            # ── Per-sample row with confidence columns ────────────────────────
             row_dict = {
                 "img_path":      img_paths[i],
                 "gt_visibility": gt_vis,
@@ -273,6 +306,12 @@ def main():
                 "mean_norm":     float(point_norm.mean()),
                 "max_norm":      float(point_norm.max()),
                 "mouth_width":   mouth_width,
+                # Confidence per landmark (softmax peak, higher = more confident)
+                "conf_pt0":      float(conf_np[0]),
+                "conf_pt1":      float(conf_np[1]),
+                "conf_pt2":      float(conf_np[2]),
+                "conf_pt3":      float(conf_np[3]),
+                "mean_conf":     float(conf_np.mean()),
             }
             if args.save_per_point:
                 for j in range(num_landmarks):
@@ -288,7 +327,8 @@ def main():
                 visualize_sample(
                     img_paths[i], face_bbox, mouth_bbox,
                     pred_abs, gt_abs if args.show_gt else None,
-                    out_png, show_gt=args.show_gt
+                    out_png, show_gt=args.show_gt,
+                    conf_np=conf_np       # ← confidence scores for overlay
                 )
 
     # ── Metrics summary ───────────────────────────────────────────────────────
@@ -311,6 +351,20 @@ def main():
         ]
         for p in pct_list:
             lines.append(f"{p}th pct : {np.percentile(all_l2_arr, p):.4f} px")
+
+        # ── Confidence summary ────────────────────────────────────────────────
+        df_conf = pd.DataFrame(per_sample_rows)
+        conf_cols = [f"conf_pt{j}" for j in range(num_landmarks)]
+        all_conf_vals = df_conf[conf_cols].values.flatten()
+
+        lines += [
+            f"",
+            f"── Confidence (softmax peak) ───────────────────────",
+            f"Mean   : {all_conf_vals.mean():.6f}",
+            f"Median : {np.median(all_conf_vals):.6f}",
+            f"Min    : {all_conf_vals.min():.6f}",
+            f"Max    : {all_conf_vals.max():.6f}",
+        ]
 
         lines += [
             f"",
